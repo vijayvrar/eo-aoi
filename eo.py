@@ -22,13 +22,13 @@ def create_rgb_image(geometry):
         collections=["sentinel-2-l2a"],
         intersects=geometry,
         datetime=f"2026-01-01/{date.today().isoformat()}",
-        query={"eo:cloud_cover": {"lt": 35}},
+        query={"eo:cloud_cover": {"lt": 10}},  # Updated to look for < 10% clouds
         max_items=10,
     )
 
     items = list(search.items())
     if not items:
-        raise ValueError("No cloud-free Sentinel-2 scenes found for this AOI.")
+        raise ValueError("No very clear (<10% cloud) Sentinel-2 scenes found for this AOI. Try expanding your search date or location.")
 
     item = items[0]
     channels = []
@@ -38,11 +38,9 @@ def create_rgb_image(geometry):
         with rasterio.open(href) as src:
             clipped_geom = transform_geom("EPSG:4326", src.crs, geometry)
             
-            # Mask and crop with downsampling safeguard if needed
             data, _ = mask(src, [clipped_geom], crop=True, filled=True)
             band = data[0].astype(np.float32)
 
-            # Check pixel dimensions to avoid RAM spike
             if band.size > MAX_PIXELS:
                 raise ValueError("Selected area is too large for the free server tier. Please draw a smaller polygon.")
 
@@ -58,7 +56,6 @@ def create_rgb_image(geometry):
             scaled = np.clip((band - p_low) / (p_high - p_low), 0, 1)
             channels.append((scaled * 255).astype(np.uint8))
             
-            # Free memory immediately
             del band, data, valid_pixels
 
     rgb = np.stack(channels, axis=-1)
@@ -72,7 +69,6 @@ def create_rgb_image(geometry):
     img.save(filepath)
     img.close()
 
-    # Force Python garbage collection to clear RAM for Render
     gc.collect()
 
     return {
