@@ -1,7 +1,6 @@
-
+import json
 from flask import Flask, render_template, request
 from eo import create_rgb_image
-import json
 
 app = Flask(__name__)
 
@@ -17,33 +16,21 @@ def home():
 
         try:
             if not aoi_json:
-                raise ValueError("Please draw an AOI first.")
+                raise ValueError("Please draw an Area of Interest (AOI) first.")
 
             aoi = json.loads(aoi_json)
+            geometry = aoi.get("geometry")
 
-            if aoi.get("type") != "Feature":
-                raise ValueError("Invalid GeoJSON feature.")
+            if not geometry:
+                raise ValueError("Invalid GeoJSON selected.")
 
-            geometry = aoi.get("geometry") or {}
-
-            if geometry.get("type") not in ("Polygon", "MultiPolygon"):
-                raise ValueError("Please draw a rectangle or polygon.")
-
-            if not geometry.get("coordinates"):
-                raise ValueError("The AOI has no coordinates.")
-
-            # Generate the satellite image using the selected geometry.
             result = create_rgb_image(geometry)
 
         except Exception as exc:
             error = str(exc)
-            app.logger.exception("AOI processing failed")
 
     return render_template(
-        "index.html",
-        result=result,
-        error=error,
-        aoi_json=aoi_json
+        "index.html", result=result, error=error, aoi_json=aoi_json
     )
 
 
