@@ -1,207 +1,83 @@
-
 import os
 import uuid
+import gc
 from datetime import date
-
 import numpy as np
 import rasterio
 from rasterio.mask import mask
 from rasterio.warp import transform_geom
 from pystac_client import Client
-from PIL import Image, ImageFilter
+from PIL import Image
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, "static", "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Initial safety limit for the generated image.
-# This is a post-read check, not a complete memory guard.
-MAX_OUTPUT_PIXELS = 2_000_000
+# Strict limit to prevent Render 512MB RAM crashes
+MAX_PIXELS = 1_000_000 
 
-
-def find_satellite_image(geometry):
-    catalog = Client.open(
-        "https://earth-search.aws.element84.com/v1"
-    )
-
-    search = catalog.search(
+def create_rgb_image(geometry):
+    client = Client.open("https://earth-search.aws.element84.com/v1")
+    search = client.search(
         collections=["sentinel-2-l2a"],
         intersects=geometry,
         datetime=f"2026-01-01/{date.today().isoformat()}",
-        query={"eo:cloud_cover": {"lt": 40}},
-        max_items=20,
+        query={"eo:cloud_cover": {"lt": 35}},
+        max_items=10,
     )
 
     items = list(search.items())
-
     if not items:
-        raise ValueError(
-            "No Sentinel-2 scenes found for this AOI. "
-            "Try another location or date range."
-        )
+        raise ValueError("No cloud-free Sentinel-2 scenes found for this AOI.")
 
-    items.sort(
-        key=lambda item: item.properties.get(
-            "eo:cloud_cover", 100
-        )
-    )
-    return items[0]
-
-
-def read_clipped_band(asset_url, geometry):
-    with rasterio.open(asset_url) as src:
-        clipped_geometry = transform_geom(
-            "EPSG:4326", src.crs, geometry
-        )
-
-        data, _ = mask(
-            src,
-            [clipped_geometry],
-            crop=True,
-            filled=False,
-        )
-
-        band = np.ma.masked_invalid(
-            data[0].astype(np.float32)
-        )
-
-        # Copy only the 2D mask and release the masked
-        # raster before returning the band's data.
-        invalid = np.ma.getmaskarray(band).copy()
-        values = band.data
-
-        valid = ~invalid
-        valid &= np.isfinite(values)
-
-        if not valid.any():
-            raise ValueError(
-                "The AOI contains no valid pixels in an RGB band."
-            )
-
-        # Calculate display stretch using valid pixels only.
-        low, high = np.percentile(
-            values[valid], [2, 98]
-        )
-
-        if high <= low:
-            raise ValueError(
-                "Unable to enhance one of the RGB bands."
-            )
-
-        # Create a compact 8-bit channel instead of retaining
-        # three full-size floating-point bands simultaneously.
-        channel = np.clip(
-            (values - low) / (high - low), 0, 1
-        )
-        channel = np.power(channel, 0.8)
-        channel = (channel * 255).astype(np.uint8)
-
-        del band, data, values, invalid
-
-        return channel, valid
-
-
-def create_rgb_image(geometry):
-    item = find_satellite_image(geometry)
-
-    for name in ("red", "green", "blue"):
-        if name not in item.assets:
-            raise ValueError(
-                f"Sentinel-2 scene is missing the {name} band."
-            )
-
+    item = items[0]
     channels = []
-    common_valid = None
-    expected_shape = None
 
-    for name in ("red", "green", "blue"):
-        channel, band_valid = read_clipped_band(
-            item.assets[name].href, geometry
-        )
+    for band_name in ("red", "green", "blue"):
+        href = item.assets[band_name].href
+        with rasterio.open(href) as src:
+            clipped_geom = transform_geom("EPSG:4326", src.crs, geometry)
+            
+            # Mask and crop with downsampling safeguard if needed
+            data, _ = mask(src, [clipped_geom], crop=True, filled=True)
+            band = data[0].astype(np.float32)
 
-        if expected_shape is None:
-            expected_shape = channel.shape
-        elif channel.shape != expected_shape:
-            raise ValueError(
-                "RGB band dimensions differ. "
-                "Try another scene or AOI."
-            )
+            # Check pixel dimensions to avoid RAM spike
+            if band.size > MAX_PIXELS:
+                raise ValueError("Selected area is too large for the free server tier. Please draw a smaller polygon.")
 
-        # Combine validity masks without stacking the float bands.
-        if common_valid is None:
-            common_valid = band_valid.copy()
-        else:
-            common_valid &= band_valid
+            valid_pixels = band[band > 0]
+            if valid_pixels.size > 0:
+                p_low, p_high = np.percentile(valid_pixels, [2, 98])
+            else:
+                p_low, p_high = 0, 1
 
-        channels.append(channel)
-        del channel, band_valid
+            if p_high <= p_low:
+                p_high = p_low + 1
 
-    height, width = expected_shape
-    pixel_count = height * width
+            scaled = np.clip((band - p_low) / (p_high - p_low), 0, 1)
+            channels.append((scaled * 255).astype(np.uint8))
+            
+            # Free memory immediately
+            del band, data, valid_pixels
 
-    if pixel_count > MAX_OUTPUT_PIXELS:
-        raise ValueError(
-            f"This AOI produces an image of {width} x {height} "
-            f"pixels, which exceeds the current limit. "
-            "Please draw a smaller AOI."
-        )
-
-    if not common_valid.any():
-        raise ValueError(
-            "The selected AOI contains no valid RGB pixels."
-        )
-
-    # Assemble the final 8-bit RGB output.
     rgb = np.stack(channels, axis=-1)
     del channels
-
-    # Sharpen RGB, keeping AOI transparency separate.
-    image = Image.fromarray(rgb)
+    
+    img = Image.fromarray(rgb)
     del rgb
 
-    image = image.filter(
-        ImageFilter.UnsharpMask(
-            radius=1, percent=80, threshold=3
-        )
-    )
+    filename = f"sentinel_{uuid.uuid4().hex[:8]}.png"
+    filepath = os.path.join(OUTPUT_DIR, filename)
+    img.save(filepath)
+    img.close()
 
-    # Apply the common mask so pixels outside the AOI
-    # remain transparent.
-    alpha = np.where(
-        common_valid, 255, 0
-    ).astype(np.uint8)
+    # Force Python garbage collection to clear RAM for Render
+    gc.collect()
 
-    image.putalpha(Image.fromarray(alpha))
-    del alpha, common_valid
-
-    filename = f"sentinel_aoi_{uuid.uuid4().hex[:12]}.png"
-    output_path = os.path.join(OUTPUT_DIR, filename)
-    image.save(output_path)
-
-    width, height = image.size
-    valid_percentage = round(
-        float(np.count_nonzero(
-            np.asarray(image.getchannel("A"))
-        ) / (width * height) * 100),
-        2,
-    )
-
-    result = {
+    return {
         "filename": filename,
-        "observation": str(
-            item.properties.get("datetime", "Unknown")
-        ),
+        "observation": item.properties.get("datetime", "Unknown")[:10],
         "granule": item.id,
         "cloud_cover": item.properties.get("eo:cloud_cover"),
-        "width": width,
-        "height": height,
-        "valid_pixel_percentage": valid_percentage,
     }
-
-    print(
-        f"AOI image generated: {width}x{height}; "
-        f"valid pixels: {valid_percentage}%; scene: {item.id}"
-    )
-
-    image.close()
-    return result
