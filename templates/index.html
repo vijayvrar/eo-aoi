@@ -1,106 +1,129 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Satellite Imagery Explorer</title>
-
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css">
-
-    <style>
-        body { font-family: Arial, sans-serif; margin: 24px; color: #222; }
-        #map { height: 420px; width: 100%; border-radius: 8px; border: 1px solid #ccc; }
-        button { padding: 12px 18px; margin-top: 12px; cursor: pointer; border: 0; border-radius: 5px; background: #1769aa; color: white; font-size: 15px; }
-        button:disabled { background: #aaa; cursor: not-allowed; }
-        .error { color: #d32f2f; background: #ffebee; border: 1px solid #ffcdd2; padding: 12px; border-radius: 6px; margin-top: 20px; }
-        .result-image { display: block; max-width: 100%; height: auto; border: 1px solid #ddd; margin-top: 10px; }
-    </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EO-AOI | Satellite Image Explorer</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css">
+  <style>
+    :root { color-scheme:light; --ink:#172033; --muted:#5e687b; --line:#dbe2ea; --accent:#1769aa; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:#f4f7fb; color:var(--ink); }
+    header { background:#10243b; color:white; padding:22px clamp(16px,4vw,42px); }
+    header h1 { margin:0 0 6px; font-size:clamp(1.4rem,3vw,2rem); }
+    header p { margin:0; color:#d9e5f3; }
+    main { max-width:1200px; margin:24px auto; padding:0 16px 40px; }
+    .panel { background:white; border:1px solid var(--line); border-radius:14px; padding:18px; margin-bottom:18px; box-shadow:0 4px 18px #1327430a; }
+    .panel h2 { margin:0 0 8px; font-size:1.15rem; }
+    .hint { color:var(--muted); font-size:.95rem; margin:0 0 14px; }
+    #map { width:100%; height:440px; border-radius:10px; border:1px solid var(--line); }
+    .actions { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-top:14px; }
+    button { border:0; border-radius:9px; padding:11px 16px; font-weight:650; cursor:pointer; }
+    button:disabled { opacity:.65; cursor:wait; }
+    .primary { color:white; background:var(--accent); }
+    .secondary { color:var(--ink); background:#e8edf4; }
+    .error { border:1px solid #f0b6b6; background:#fff1f1; color:#8b1e1e; padding:12px 14px; border-radius:10px; margin-bottom:18px; }
+    .result-image { display:block; max-width:100%; height:auto; margin:14px auto 0; border-radius:8px; background:#edf1f5; }
+    .metadata { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; margin-top:14px; }
+    .meta { background:#f5f8fc; border:1px solid var(--line); padding:11px; border-radius:9px; overflow-wrap:anywhere; }
+    .meta strong { display:block; font-size:.8rem; color:var(--muted); margin-bottom:4px; }
+    footer { text-align:center; color:var(--muted); font-size:.85rem; padding:8px 16px 24px; }
+  </style>
 </head>
 <body>
-
-    <h1>Satellite Imagery Explorer</h1>
-    <p>Draw a rectangle or polygon on the map to select your Area of Interest (AOI).</p>
-
-    <div id="map"></div>
-
-    <form method="POST" id="aoiForm">
-        <input type="hidden" name="aoi" id="aoi" value="{{ aoi_json }}">
-        <button type="submit" id="submitBtn" {% if not aoi_json %}disabled{% endif %}>
-            Get Satellite Image
-        </button>
-        <span id="status"></span>
+<header>
+  <h1>EO-AOI: Satellite Image Explorer</h1>
+  <p>Draw an Area of Interest and generate an RGB image from Sentinel-2 imagery.</p>
+</header>
+<main>
+  {% if error %}<div class="error"><strong>Could not process AOI:</strong> {{ error }}</div>{% endif %}
+  <section class="panel">
+    <h2>1. Select your Area of Interest</h2>
+    <p class="hint">Use the drawing tools at the map's upper-right to draw a rectangle or polygon, then generate the image.</p>
+    <div id="map" aria-label="Map for drawing an area of interest"></div>
+    <form id="aoi-form" method="post" action="/">
+      <input type="hidden" id="aoi_geojson" name="aoi_geojson" value="{{ aoi_json|e }}">
+      <div class="actions">
+        <button class="primary" id="submit-button" type="submit">Generate satellite image</button>
+        <button class="secondary" id="clear-button" type="button">Clear AOI</button>
+        <span class="hint" id="aoi-status" aria-live="polite">No AOI selected yet.</span>
+      </div>
     </form>
+  </section>
+  {% if result %}
+  <section class="panel">
+    <h2>2. Satellite image result</h2>
+    <p class="hint">RGB visualisation clipped to your AOI. Colours are enhanced for display, not calibrated scientific measurements.</p>
+    <img class="result-image" src="{{ result.image_url }}" alt="RGB satellite image clipped to the selected area">
+    <div class="metadata">
+      <div class="meta"><strong>Acquisition date</strong>{{ result.observation }}</div>
+      <div class="meta"><strong>Scene ID</strong>{{ result.granule }}</div>
+      <div class="meta"><strong>Scene cloud cover</strong>{% if result.cloud_cover is not none %}{{ result.cloud_cover }}%{% else %}Not reported{% endif %}</div>
+      <div class="meta"><strong>Output dimensions</strong>{{ result.width }} × {{ result.height }} pixels</div>
+      <div class="meta"><strong>Valid AOI pixels</strong>{{ result.valid_pixel_percentage }}%</div>
+    </div>
+  </section>
+  {% endif %}
+</main>
+<footer>Educational demonstration · Sentinel-2 imagery discovered via Earth Search STAC</footer>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<script>
+  const map = L.map('map').setView([9.9252, 78.1198], 12);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom:19, attribution:'&copy; OpenStreetMap contributors'
+  }).addTo(map);
 
-    {% if error %}
-        <div class="error">
-            <h3>Processing Error</h3>
-            <p>{{ error }}</p>
-        </div>
-    {% endif %}
+  const drawnItems = new L.FeatureGroup();
+  map.addLayer(drawnItems);
+  map.addControl(new L.Control.Draw({
+    draw:{ polygon:{allowIntersection:false,showArea:true}, rectangle:true,
+      polyline:false, circle:false, circlemarker:false, marker:false },
+    edit:{ featureGroup:drawnItems, edit:false, remove:false }
+  }));
 
-    {% if result %}
-        <hr>
-        <h2>Clipped Satellite Image</h2>
-        <img class="result-image" src="{{ url_for('static', filename='outputs/' + result.filename) }}" alt="Satellite AOI Image">
-        <div style="margin-top: 10px;">
-            <p><strong>Acquisition Date:</strong> {{ result.observation }}</p>
-            <p><strong>Scene ID:</strong> {{ result.granule }}</p>
-            <p><strong>Cloud Cover:</strong> {{ result.cloud_cover }}%</p>
-        </div>
-    {% endif %}
+  const geoInput = document.getElementById('aoi_geojson');
+  const status = document.getElementById('aoi-status');
+  const form = document.getElementById('aoi-form');
+  const submitButton = document.getElementById('submit-button');
 
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+  function saveAOI(layer) {
+    geoInput.value = JSON.stringify(layer.toGeoJSON());
+    status.textContent = 'AOI selected. Ready to generate the image.';
+  }
+  map.on(L.Draw.Event.CREATED, function (event) {
+    drawnItems.clearLayers();
+    drawnItems.addLayer(event.layer);
+    saveAOI(event.layer);
+  });
+  document.getElementById('clear-button').addEventListener('click', function () {
+    drawnItems.clearLayers();
+    geoInput.value = '';
+    status.textContent = 'AOI cleared. Draw a rectangle or polygon.';
+  });
+  form.addEventListener('submit', function (event) {
+    if (!geoInput.value.trim()) {
+      event.preventDefault();
+      status.textContent = 'Please draw a rectangle or polygon first.';
+      return;
+    }
+    submitButton.disabled = true;
+    submitButton.textContent = 'Processing satellite image…';
+  });
 
-    <script>
-        const map = L.map('map').setView([9.9252, 78.1198], 8);
-
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            maxZoom: 19,
-            attribution: '&copy; OpenStreetMap contributors'
-        }).addTo(map);
-
-        const drawnItems = new L.FeatureGroup();
-        map.addLayer(drawnItems);
-
-        const drawControl = new L.Control.Draw({
-            draw: { rectangle: true, polygon: true, polyline: false, circle: false, marker: false, circlemarker: false },
-            edit: { featureGroup: drawnItems }
-        });
-        map.addControl(drawControl);
-
-        const aoiInput = document.getElementById('aoi');
-        const submitBtn = document.getElementById('submitBtn');
-        const status = document.getElementById('status');
-
-        map.on(L.Draw.Event.CREATED, function (e) {
-            drawnItems.clearLayers();
-            drawnItems.addLayer(e.layer);
-            aoiInput.value = JSON.stringify(e.layer.toGeoJSON());
-            submitBtn.disabled = false;
-        });
-
-        map.on(L.Draw.Event.DELETED, function () {
-            aoiInput.value = "";
-            submitBtn.disabled = true;
-        });
-
-        // Restore previously selected AOI on reload
-        const savedAOI = {{ (aoi_json or '') | tojson }};
-        if (savedAOI) {
-            try {
-                const feature = JSON.parse(savedAOI);
-                const restoredLayer = L.geoJSON(feature);
-                restoredLayer.eachLayer(layer => drawnItems.addLayer(layer));
-                map.fitBounds(drawnItems.getBounds());
-            } catch (err) {}
-        }
-
-        document.getElementById('aoiForm').addEventListener('submit', function() {
-            submitBtn.disabled = true;
-            status.textContent = " Processing satellite image... Please wait.";
-        });
-    </script>
+  if (geoInput.value.trim()) {
+    try {
+      const feature = JSON.parse(geoInput.value);
+      L.geoJSON(feature).eachLayer(function (layer) { drawnItems.addLayer(layer); });
+      const bounds = drawnItems.getBounds();
+      if (bounds.isValid()) map.fitBounds(bounds.pad(0.15));
+      status.textContent = 'AOI loaded.';
+    } catch (e) {
+      geoInput.value = '';
+      status.textContent = 'Please redraw your AOI.';
+    }
+  }
+</script>
 </body>
 </html>
