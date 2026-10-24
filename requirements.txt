@@ -1,5 +1,6 @@
 Flask
-rasterio
+gunicorn
 numpy
+rasterio
 pillow
 pystac-client
