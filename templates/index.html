@@ -1,0 +1,310 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <title>Satellite Imagery Explorer | Tamil Space Tech</title>
+
+    <link
+        rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    >
+
+    <link
+        rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css"
+    >
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 24px;
+            color: #222;
+            line-height: 1.5;
+        }
+
+        #map {
+            height: 480px;
+            width: 100%;
+            border-radius: 8px;
+            border: 1px solid #ccc;
+        }
+
+        button {
+            padding: 12px 18px;
+            margin: 12px 0;
+            cursor: pointer;
+            border: 0;
+            border-radius: 5px;
+            background: #1769aa;
+            color: white;
+            font-size: 15px;
+        }
+
+        button:disabled {
+            background: #aaa;
+            cursor: not-allowed;
+        }
+
+        #coordinates {
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            font-size: 12px;
+            background: #f5f5f5;
+            padding: 12px;
+            border-radius: 5px;
+        }
+
+        .error {
+            border: 1px solid #cc4444;
+            padding: 12px;
+            border-radius: 6px;
+            margin-top: 20px;
+        }
+
+        .result-image {
+            display: block;
+            max-width: 100%;
+            height: auto;
+            border: 1px solid #ddd;
+            background: #eee;
+        }
+
+        .details {
+            padding: 12px 0;
+        }
+
+        #status {
+            margin-left: 8px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>Satellite Imagery Explorer</h1>
+
+    <p>
+        Draw a rectangle or polygon on the map to select your
+        Area of Interest (AOI).
+    </p>
+
+    <div id="map"></div>
+
+    <h2>Selected AOI</h2>
+
+    <p id="aoiStatus">No AOI selected yet.</p>
+
+    <pre id="coordinates">No AOI selected yet.</pre>
+
+    <form method="POST" id="aoiForm">
+
+        <input
+            type="hidden"
+            name="aoi"
+            id="aoi"
+            value=""
+        >
+
+        <button type="submit" id="submitBtn" disabled>
+            Get Satellite Image
+        </button>
+
+        <span id="status" role="status"></span>
+
+    </form>
+
+    {% if error %}
+        <div class="error">
+            <h2>Processing Error</h2>
+            <p>{{ error }}</p>
+            <p>Check the VS Code terminal for the full traceback.</p>
+        </div>
+    {% endif %}
+
+    {% if result %}
+        <hr>
+
+        <h2>Satellite Image Clipped to AOI</h2>
+
+        <img
+            class="result-image"
+            src="{{ url_for(
+                'static',
+                filename='outputs/' + result.filename
+            ) }}?v={{ result.granule }}"
+            alt="Sentinel-2 satellite image clipped to the selected AOI"
+        >
+
+        <div class="details">
+            <h3>Observation Details</h3>
+
+            <p>
+                <strong>Acquisition date:</strong>
+                {{ result.observation }}
+            </p>
+
+            <p>
+                <strong>Scene ID:</strong>
+                {{ result.granule }}
+            </p>
+
+            <p>
+                <strong>Cloud cover:</strong>
+                {% if result.cloud_cover is not none %}
+                    {{ result.cloud_cover }}%
+                {% else %}
+                    Not available
+                {% endif %}
+            </p>
+
+            <p>
+                <strong>Image dimensions:</strong>
+                {{ result.width }} × {{ result.height }} pixels
+            </p>
+        </div>
+    {% endif %}
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+
+    <script>
+        // Initialize map over Tamil Nadu.
+        const map = L.map("map").setView(
+            [9.9252, 78.1198],
+            8
+        );
+
+        L.tileLayer(
+            "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+            {
+                maxZoom: 19,
+                attribution: "&copy; OpenStreetMap contributors"
+            }
+        ).addTo(map);
+
+        // Store the selected AOI.
+        const drawnItems = new L.FeatureGroup();
+        map.addLayer(drawnItems);
+
+        // Drawing and editing controls.
+        const drawControl = new L.Control.Draw({
+            draw: {
+                rectangle: true,
+                polygon: true,
+                polyline: false,
+                circle: false,
+                circlemarker: false,
+                marker: false
+            },
+            edit: {
+                featureGroup: drawnItems
+            }
+        });
+
+        map.addControl(drawControl);
+
+        const form = document.getElementById("aoiForm");
+        const aoiInput = document.getElementById("aoi");
+        const coordinates = document.getElementById("coordinates");
+        const aoiStatus = document.getElementById("aoiStatus");
+        const submitBtn = document.getElementById("submitBtn");
+        const status = document.getElementById("status");
+
+        // Convert the drawn shape into GeoJSON.
+        function updateAOI(layer) {
+            const feature = layer.toGeoJSON();
+
+            aoiInput.value = JSON.stringify(feature);
+
+            coordinates.textContent = JSON.stringify(
+                feature.geometry,
+                null,
+                2
+            );
+
+            aoiStatus.textContent = "AOI selected successfully.";
+            submitBtn.disabled = false;
+            status.textContent = "";
+        }
+
+        // Draw a new AOI.
+        map.on(L.Draw.Event.CREATED, function (event) {
+            drawnItems.clearLayers();
+            drawnItems.addLayer(event.layer);
+
+            updateAOI(event.layer);
+        });
+
+        // Save changes after editing.
+        map.on(L.Draw.Event.EDITED, function () {
+            const layers = drawnItems.getLayers();
+
+            if (layers.length > 0) {
+                updateAOI(layers[0]);
+            }
+        });
+
+        // Clear the form when the AOI is deleted.
+        map.on(L.Draw.Event.DELETED, function () {
+            aoiInput.value = "";
+            coordinates.textContent = "No AOI selected yet.";
+            aoiStatus.textContent = "No AOI selected yet.";
+            submitBtn.disabled = true;
+            status.textContent = "";
+        });
+
+        // Restore the submitted AOI after Flask reloads the page.
+        const savedAOI = {{ (aoi_json or '') | tojson }};
+
+        if (savedAOI) {
+            try {
+                const feature = JSON.parse(savedAOI);
+                const restoredLayer = L.geoJSON(feature);
+
+                restoredLayer.eachLayer(function (layer) {
+                    drawnItems.addLayer(layer);
+                });
+
+                if (drawnItems.getLayers().length > 0) {
+                    coordinates.textContent = JSON.stringify(
+                        feature.geometry,
+                        null,
+                        2
+                    );
+
+                    aoiStatus.textContent =
+                        "AOI restored successfully.";
+
+                    submitBtn.disabled = false;
+
+                    map.fitBounds(drawnItems.getBounds(), {
+                        padding: [20, 20]
+                    });
+                }
+            } catch (err) {
+                console.error("AOI restoration failed:", err);
+                aoiStatus.textContent =
+                    "Could not restore the AOI. Please draw it again.";
+            }
+        }
+
+        // Prevent submission without a selected AOI.
+        form.addEventListener("submit", function (event) {
+            if (!aoiInput.value) {
+                event.preventDefault();
+                alert("Please draw a rectangle or polygon first.");
+                return;
+            }
+
+            submitBtn.disabled = true;
+            status.textContent =
+                "Searching Sentinel-2 and processing imagery. Please wait...";
+        });
+    </script>
+
+</body>
+</html>
