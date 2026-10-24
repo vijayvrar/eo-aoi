@@ -1,79 +1,119 @@
-import os
+from datetime import date, timedelta
+from pathlib import Path
 import uuid
-import gc
-from datetime import date
+
 import numpy as np
 import rasterio
 from rasterio.mask import mask
 from rasterio.warp import transform_geom
+from PIL import Image, ImageFilter
 from pystac_client import Client
-from PIL import Image
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(BASE_DIR, "static", "outputs")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+STAC_URL = "https://earth-search.aws.element84.com/v1"
+COLLECTION = "sentinel-2-l2a"
+MAX_OUTPUT_PIXELS = 2_000_000
 
-# Strict limit to prevent Render 512MB RAM crashes
-MAX_PIXELS = 1_000_000 
 
-def create_rgb_image(geometry):
-    client = Client.open("https://earth-search.aws.element84.com/v1")
+def find_satellite_image(geometry):
+    """Find a relatively clear Sentinel-2 item intersecting the AOI."""
+    client = Client.open(STAC_URL)
+    end_date = date.today()
+    start_date = end_date - timedelta(days=365)
+
     search = client.search(
-        collections=["sentinel-2-l2a"],
+        collections=[COLLECTION],
         intersects=geometry,
-        datetime=f"2026-01-01/{date.today().isoformat()}",
-        query={"eo:cloud_cover": {"lt": 10}},  # Updated to look for < 10% clouds
-        max_items=10,
+        datetime=f"{start_date.isoformat()}/{end_date.isoformat()}",
+        query={"eo:cloud_cover": {"lt": 40}},
+        max_items=30,
     )
-
     items = list(search.items())
+
     if not items:
-        raise ValueError("No very clear (<10% cloud) Sentinel-2 scenes found for this AOI. Try expanding your search date or location.")
+        search = client.search(
+            collections=[COLLECTION],
+            intersects=geometry,
+            datetime=f"{start_date.isoformat()}/{end_date.isoformat()}",
+            max_items=30,
+        )
+        items = list(search.items())
 
-    item = items[0]
-    channels = []
+    if not items:
+        raise RuntimeError(
+            "No Sentinel-2 scenes were found for this AOI in the last 12 months. "
+            "Try a larger AOI or another location."
+        )
 
-    for band_name in ("red", "green", "blue"):
-        href = item.assets[band_name].href
-        with rasterio.open(href) as src:
-            clipped_geom = transform_geom("EPSG:4326", src.crs, geometry)
-            
-            data, _ = mask(src, [clipped_geom], crop=True, filled=True)
-            band = data[0].astype(np.float32)
+    items.sort(key=lambda item: item.properties.get("eo:cloud_cover", 100))
+    return items[0]
 
-            if band.size > MAX_PIXELS:
-                raise ValueError("Selected area is too large for the free server tier. Please draw a smaller polygon.")
 
-            valid_pixels = band[band > 0]
-            if valid_pixels.size > 0:
-                p_low, p_high = np.percentile(valid_pixels, [2, 98])
-            else:
-                p_low, p_high = 0, 1
+def _read_band(href, geometry):
+    """Read one band, clip it to the AOI, and return an 8-bit channel and mask."""
+    with rasterio.open(href) as src:
+        projected_geometry = transform_geom("EPSG:4326", src.crs, geometry)
+        clipped, _ = mask(src, [projected_geometry], crop=True, filled=False)
 
-            if p_high <= p_low:
-                p_high = p_low + 1
+        band = clipped[0]
+        data = np.asarray(band.data, dtype=np.float32)
+        valid = ~np.ma.getmaskarray(band) & np.isfinite(data)
 
-            scaled = np.clip((band - p_low) / (p_high - p_low), 0, 1)
-            channels.append((scaled * 255).astype(np.uint8))
-            
-            del band, data, valid_pixels
+    if not np.any(valid):
+        raise RuntimeError("The AOI contains no valid pixels in one of the RGB bands.")
 
-    rgb = np.stack(channels, axis=-1)
-    del channels
-    
-    img = Image.fromarray(rgb)
-    del rgb
+    values = data[valid]
+    low, high = np.percentile(values, [2, 98])
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        channel = np.zeros(data.shape, dtype=np.uint8)
+    else:
+        scaled = np.clip((data - low) / (high - low), 0, 1)
+        channel = (scaled * 255).astype(np.uint8)
 
-    filename = f"sentinel_{uuid.uuid4().hex[:8]}.png"
-    filepath = os.path.join(OUTPUT_DIR, filename)
-    img.save(filepath)
-    img.close()
+    channel[~valid] = 0
+    return channel, valid
 
-    gc.collect()
 
+def create_rgb_image(geometry, output_dir):
+    """Create an enhanced RGB PNG clipped to the submitted GeoJSON AOI."""
+    item = find_satellite_image(geometry)
+    band_hrefs = [item.assets[key].href if key in item.assets else None
+                  for key in ("red", "green", "blue")]
+    if any(href is None for href in band_hrefs):
+        raise RuntimeError("Selected Sentinel-2 scene is missing a red, green, or blue band asset.")
+
+    red, red_valid = _read_band(band_hrefs[0], geometry)
+    green, green_valid = _read_band(band_hrefs[1], geometry)
+    blue, blue_valid = _read_band(band_hrefs[2], geometry)
+
+    if red.shape != green.shape or red.shape != blue.shape:
+        raise RuntimeError("RGB bands have different clipped dimensions. Try a smaller AOI.")
+
+    height, width = red.shape
+    if height * width > MAX_OUTPUT_PIXELS:
+        raise RuntimeError(
+            f"AOI is too large ({width} × {height} pixels). Draw a smaller AOI and try again."
+        )
+
+    valid = red_valid & green_valid & blue_valid
+    rgb = np.dstack((red, green, blue))
+    image = Image.fromarray(rgb, mode="RGB")
+    image = image.filter(ImageFilter.UnsharpMask(radius=1, percent=110, threshold=3))
+
+    rgba = image.convert("RGBA")
+    rgba.putalpha(Image.fromarray(valid.astype(np.uint8) * 255, mode="L"))
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"sentinel_aoi_{uuid.uuid4().hex[:12]}.png"
+    rgba.save(output_dir / filename, optimize=True)
+
+    cloud_cover = item.properties.get("eo:cloud_cover")
     return {
         "filename": filename,
-        "observation": item.properties.get("datetime", "Unknown")[:10],
+        "observation": item.properties.get("datetime", "Unknown"),
         "granule": item.id,
-        "cloud_cover": item.properties.get("eo:cloud_cover"),
+        "cloud_cover": round(float(cloud_cover), 2) if cloud_cover is not None else None,
+        "width": width,
+        "height": height,
+        "valid_pixel_percentage": round(float(valid.mean() * 100), 2),
     }
